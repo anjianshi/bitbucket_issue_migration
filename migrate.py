@@ -1,3 +1,24 @@
+# -*- coding: utf-8 -*-
+"""
+项目迁移步骤：
+
+1. 整理 commit message (http://yangtingpretty.blog.163.com/blog/static/18057748620129182316220/)
+    1. 把 fix issues #xx 改为 fix #xx  (https://help.github.com/articles/interactive-rebase | git rebase -i | multi reword)
+    2. 把 fix 了某些 issue 但忘了写在 message 里的给补上。如 fix by tag 0.3
+    3. 把 fix #11, #22 改成 fix #11, fix #22  要不然对 #22 不生效
+2. git rebase 后 commit hash 会改变，如果在 issue/comment 里引用到了，也要做相应改变
+3. 在 github 中创建项目，不导入代码
+4. 执行此脚本导入 issues
+5. 导入代码（在这途中，被 fix 的 issues 会被自动关闭）
+6. 执行另一个脚本或手动关闭那些不是被自动关闭的 issues
+    1. 关闭 bitbucket 中为 resolved 但到现在为为止，github 中还是 open 的 issue（也就是 bitbucket 中被手动关闭的 issues）
+    1. 关闭 wontfix issues
+    2. 创建 onhold label，应用到对应的 issue
+
+先把所有 issue 创建完，然后再创建 comments
+因为有些 comment 会引用在当前 issue 之后创建的 issue，例如：#20 的 comment 可能会引用 #21
+在 issue/comment A 中引用另一个 issue B 时，github 会在 B 处显示一条提醒，而这在引用之后创建的 issue 时无效
+"""
 # This file is part of the bitbucket issue migration script.
 # 
 # The script is free software: you can redistribute it and/or modify
@@ -14,23 +35,26 @@
 # along with the bitbucket issue migration script.
 # If not, see <http://www.gnu.org/licenses/>.
 
-from pygithub3 import Github
+from github import Github
 from datetime import datetime, timedelta
-import urllib2
+import requests
 import time
-
 import sys
-
-try:
-    import json
-except ImportError:
-    import simplejson as json
-
+import json
 from optparse import OptionParser
+import re
+import os
+
+
+# ===== 解析参数 =====
+
 parser = OptionParser()
 
 parser.add_option("-t", "--dry-run", action="store_true", dest="dry_run", default=False,
     help="Preform a dry run and print eveything.")
+
+parser.add_option("-r", "--reindex", action="store_true", dest="reindex", default=False,
+    help="when cache exists, clean it and get issues/comments data again from bitbucket")
 
 parser.add_option("-g", "--github-username", dest="github_username",
     help="GitHub username")
@@ -44,181 +68,135 @@ parser.add_option("-s", "--bitbucket_repo", dest="bitbucket_repo",
 parser.add_option("-u", "--bitbucket_username", dest="bitbucket_username",
     help="Bitbucket username")
 
-(options, args) = parser.parse_args()
+(opt, _) = parser.parse_args()
+
+#github_password = raw_input('Please enter your github password: ')
+github_password = 'jsan0821'
 
 
-bitbucket_password = raw_input('Please enter your github password: ')
+# ===== 从 bitbucket 提取数据 =====
 
-# Login in to github and create object
-github = Github(login=options.github_username, password=bitbucket_password)
+def bitbucket_api(res_url):
+    url = 'https://bitbucket.org/api/1.0' + res_url
+    print url
+    return requests.get(url).json()
 
 
+def get_issues():
+    issues = []
+    while True:
+        result = bitbucket_api("/repositories/{}/{}/issues/?limit=45&start={}".format(opt.bitbucket_username, opt.bitbucket_repo, len(issues)))
+        if not result['issues']:
+            # Check to see if there is issues to process if not break out.
+            break
 
-# Formatters
+        issues.extend(result['issues'])
+    # issue 排序
+    issues = sorted(issues, key=lambda issue: issue['local_id'])
+    return issues
 
-def format_user(author_info):
-    name = "Anonymous"
-    if not author_info:
-        return name
-    if 'first_name' in author_info and 'last_name' in author_info:
-        name = " ".join([ author_info['first_name'],author_info['last_name']])
-    elif 'username' in author_info:
-        name = author_info['username']
-    if 'username' in author_info:
-        return '[%s](http://bitbucket.org/%s)' % (name, author_info['username'])
-    else:
-        return name
 
-def format_name(issue):
-    if 'reported_by' in issue:
-        return format_user(issue['reported_by'])
-    else:
-        return "Anonymous"
-
-def format_body(issue):
-    content = clean_body(issue.get('content'))
-    url = "https://bitbucket.org/%s/%s/issue/%s" % (options.bitbucket_username, options.bitbucket_repo, issue['local_id'])
-    return content + """\n
----------------------------------------
-- Bitbucket: %s
-- Originally Reported By: %s
-- Originally Created At: %s
-""" % (url, format_name(issue), issue['created_on'])
-
-def format_comment(comment):
-    return comment['body'] + """\n
----------------------------------------
-Original Comment By: %s
-    """ % (comment['user'].encode('utf-8'))
-
-def clean_body(body):
-    lines = []
-    in_block = False
-    for line in unicode(body).splitlines():
-        if line.startswith("{{{") or line.startswith("}}}"):
-            if "{{{" in line:
-                before, part, after = line.partition("{{{")
-                lines.append('    ' + after)
-                in_block = True
-
-            if "}}}" in line:
-                before, part, after = line.partition("}}}")
-                lines.append('    ' + before)
-                in_block = False
-        else:
-            if in_block:
-                lines.append("    " + line)
-            else:
-                lines.append(line.replace("{{{", "`").replace("}}}", "`"))
-    return "\n".join(lines)
-
-def get_comments(issue):
-    '''
-    Fetch the comments for an issue
-    '''
-    url = "https://api.bitbucket.org/1.0/repositories/%s/%s/issues/%s/comments/" % (options.bitbucket_username, options.bitbucket_repo, issue['local_id'])
-    result = json.loads(urllib2.urlopen(url).read())
-
-    comments = []
-    for comment in result:
-        body = comment['content'] or ''
-
-        # Status comments (assigned, version, etc. changes) have in bitbucket no body
-        if body:
-            comments.append({
-                'user': format_user(comment['author_info']),
-                'created_at': comment['utc_created_on'],
-                'body': body.encode('utf-8'),
-                'number': comment['comment_id']
-            })
-
+def get_comments(issue_id):
+    comments = bitbucket_api("/repositories/{}/{}/issues/{}/comments".format(
+        opt.bitbucket_username, opt.bitbucket_repo, issue_id))
+    # 修正 comment 顺序
+    comments.reverse()
     return comments
 
 
-start = 0
-issue_counts = 0
-issues = []
-while True:
-    url = "https://api.bitbucket.org/1.0/repositories/%s/%s/issues/?start=%d" % (options.bitbucket_username, options.bitbucket_repo, start)
-    response = urllib2.urlopen(url)
-    result = json.loads(response.read())
-    if not result['issues']:
-        # Check to see if there is issues to process if not break out.
-        break
+def extract_data():
+    cache_exists = os.path.isfile('cache.json')
 
-    for issue in result['issues']:
-        issues.append(issue)
-        start += 1
+    # 清理缓存
+    if cache_exists and opt.reindex:
+        os.remove('cache.json')
+        cache_exists = False
+
+    if not cache_exists: # 若缓存不存在，从 bitbucket 提取 issues 及其 comments，建立缓存
+        # [ [issue_data, comments_data] ]
+        issue_pairs = [[issue, get_comments(issue['local_id'])] for issue in get_issues()]
+
+        with open('cache.json', 'w+') as cache_file:
+            cache_file.write(json.dumps(issue_pairs, indent=2, ensure_ascii=False))
+    else:   # 若缓存存在，从缓存中提取数据
+        with open('cache.json') as cache_file:
+            issue_pairs = json.loads(cache_file.read())
+
+    return issue_pairs
 
 
-# Sort issues, to sync issue numbers on freshly created GitHub projects.
-# Note: not memory efficient, could use too much memory on large projects.
-for issue in sorted(issues, key=lambda issue: issue['local_id']):
-    comments = get_comments(issue)
-    
+# ===== 在 Github 上创建 Issue、comment =====
 
-    if options.dry_run:
-        print "Title: {0}".format(issue.get('title'))
-        print "Body: {0}".format(format_body(issue))
-        print "Comments", [comment['body'] for comment in comments]
+def format_time(bitbucket_utc_time_str):
+    t = datetime.strptime(bitbucket_utc_time_str[:-6], '%Y-%m-%d %H:%M:%S') + timedelta(hours=8)
+    return datetime.strftime(t, '%Y-%m-%d %H:%M:%S')
+
+
+# Login in to github and create object
+github = Github(opt.github_username, github_password)
+repo = github.get_repo(opt.github_repo)
+
+labels = {}
+for label in repo.get_labels():
+    labels[label.name] = label
+
+issue_count = 0
+
+for issue, comments in extract_data():
+    issue_count += 1
+    # 创建 issue
+    data = {}
+    data['title'] = issue['title']
+    data['assignee'] = opt.github_username
+
+    data['body'] = issue['content'] + "\n\n\ncreated: " + format_time(issue['utc_created_on'])
+    if issue['metadata']['kind'] not in ['bug', 'enhancement']:
+        data['body'] += "\nkind: " + issue['metadata']['kind']
+
+    issue_labels = []
+    issue_labels.append(labels['bug'] if issue['metadata']['kind'] == 'bug' else labels['enhancement'])
+    if issue['status'] in ['duplicate', 'invalid', 'wontfix']:
+        issue_labels.append(labels[issue['status']])
+    data['labels'] = issue_labels
+
+    if opt.dry_run:
+        print u"Title: {}".format(data['title'])
+        print u"Body: {}".format(data['body'])
+        print "Comments"
     else:
-        # Create the isssue
-        issue_data = {'title': issue.get('title').encode('utf-8'),
-                      'body': format_body(issue).encode('utf-8')}
-        ni = github.issues.create(issue_data,
-                                  options.github_username,
-                                  options.github_repo)
-        
-        # Set the status and labels
-        if issue.get('status') == 'resolved':
-            github.issues.update(ni.number,
-                                 {'state': 'closed'},
-                                 user=options.github_username,
-                                 repo=options.github_repo)
+        issue_obj = repo.create_issue(**data)
+        #if issue['status'] in ['resolved', 'duplicate', 'invalid', 'wontfix']:
+        #    issue_obj.edit(state='closed')
 
-        # Everything else is done with labels in github
-        # TODO: there seems to be a problem with the add_to_issue method of
-        #       pygithub3, so it's not possible to assign labels to issues
-        
-        elif issue.get('status') == 'wontfix':
-            pass
-        elif issue.get('status') == 'on hold':
-            pass
-        elif issue.get('status') == 'invalid':
-            pass
-        elif issue.get('status') == 'duplicate':
-            pass
-        elif issue.get('status') == 'wontfix':
-            pass
-        
-        #github.issues.labels.add_to_issue(ni.number,
-        #                                  issue['metadata']['kind'], 
-        #                                  user=options.github_username,
-        #                                  repo=options.github_repo,
-        #                                  )
-        #sys.exit()
-        
-        #github.issues.labels.add_to_issue(ni.number,
-        #                                  options.github_username,
-        #                                  options.github_repo,
-        #                                  ('import',))
-        
-        # Milestones
-        
-        
-        
-        # Add the comments
-        comment_count = 0
-        for comment in comments:
-            github.issues.comments.create(ni.number,
-                                        format_comment(comment),
-                                        options.github_username,
-                                        options.github_repo)
-            comment_count += 1
+    # 创建 comment
+    comments_count = 0
+    for comment in comments:
+        if not comment['content']:
+            continue
+        comments_count += 1
 
-        print "Created: {0} with {1} comments".format(issue['title'], comment_count)
-    issue_counts += 1
+        content = comment['content']
+        
+        match = re.search(ur'→ <<cset (\w{12})>>', content)
+        if match is not None:
+            #content = re.sub(ur'→ <<cset (\w{12})>>', '', content)
+            #content = "\n".join(["> " + line for line in content.split("\n")]) # add blockquate
+            #content = u"resolved by {}\n\n".format(match.groups()[0]) + content
+            continue
 
-print "Created {0} issues".format(issue_counts)
+        created = format_time(comment['utc_created_on'])
+        updated = format_time(comment['utc_updated_on'])
+        content += "\n\n\ncreated: " + created
+        if updated != created:
+            content += "\nlast updated: " + updated
+        
+        if opt.dry_run:
+            print content + "\n\n"
+        else:
+            issue_obj.create_comment(content)
+
+    print u"Created: {} with {} comments".format(data['title'], comments_count)
+
+print "Created {0} issues".format(issue_count)
 
 sys.exit()

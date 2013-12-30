@@ -34,3 +34,5 @@ You will need to install the requirements first
 
 Note: if you need to migrate to a GitHub organizational repository, use your personal username,
 but the appropriate API token for the repository.
+
+Note: Make sure your bitbucket repo's issues was public
